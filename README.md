@@ -1,5 +1,13 @@
-# Vibe Coded Detector With Colab
+# Canvas submission metadata triage
 
-## Python
+Run `ai_detector.py` as cells in Google Colab, or use the linked notebook in its opening comment. Upload Canvas ZIPs or individual `.docx`, `.xlsx`, `.xlsm`, `.pptx`, or `.pdf` files. The script creates an Excel report. Install `pypdf` in Colab as prompted; pandas and openpyxl are also required.
 
-### Accommodates multiple file submissions as well as all major office file types. 
+## Metadata inventory
+
+The **Metadata Inventory** sheet contains one row per observation for every submission, with the relative submission path, internal source and property name. It adds all readable Office core and extended properties (including revision and document statistics), named custom properties and types, Office web add-in references, external relationship types and targets, comment and tracked-change authors and dates where stored, workbook and calculation settings, and indicators for VBA projects, embedded objects and signature parts. PDF document-information fields are listed as stored. Other sheets retain the existing summaries and exact duplicate groups. Identical submissions are still listed separately in the inventory.
+
+External targets can include URLs, paths or identifiers. Names and timestamps in comments and revisions can be personal information. Treat the report accordingly. The inventory avoids copying comment and tracked-change text, but the existing term checker scans the whole Office XML package, including document content. Values are taken from the submitted file, not verified against Office or Canvas records. Properties can be missing, changed, reset, or inaccurate. A signature part's presence does not verify a signature. Add-in references do not establish use. The separately displayed hard-coded add-in names are unverified and should not be relied on without checking the store ID.
+
+The file cannot establish the complete editing history, keystrokes, clipboard use, who actually authored content, whether an add-in was used, or whether AI was used. Cloud version history and Canvas submission events require access to those services. Encrypted files requiring passwords cannot be fully read. Legacy `.doc`, `.xls`, and `.ppt`, PDF XMP metadata, and comments in separate Office formats not covered by the inventory are not fully inventoried.
+
+The existing **AI likelihood score is an unvalidated heuristic, not a probability or evidence of misconduct**. Common software, missing fields, matching timestamps, and words appearing in the document can affect it. Use the raw observations and review the work in context; do not use the score for decisions about students. Structural matches can arise from common templates; PDF files are excluded from the similar-structure grouping.

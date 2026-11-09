@@ -52,7 +52,7 @@ for zip_name in zip_names:
     with zipfile.ZipFile(zip_path) as zf:
         for member in zf.infolist():
             target = (zip_extract_dir / member.filename).resolve()
-            if not str(target).startswith(str(zip_extract_dir.resolve())):
+            if not target.is_relative_to(zip_extract_dir.resolve()):
                 raise ValueError(f'Unsafe ZIP path detected in {zip_path.name}: {member.filename}')
             zf.extract(member, zip_extract_dir)
 
@@ -184,6 +184,8 @@ def ooxml_info(path):
 def pdf_info(path):
     meta, evidence, details = {}, [], {}
     reader = PdfReader(str(path))
+    if reader.is_encrypted and not reader.decrypt(''):
+        raise ValueError('Encrypted PDF requires a password')
     raw = reader.metadata or {}
     keymap = {'/Author':'creator','/Creator':'application','/Producer':'producer','/Title':'title','/Subject':'subject','/Keywords':'keywords','/CreationDate':'created','/ModDate':'modified'}
     meta = {new: clean(raw.get(old, '')) for old,new in keymap.items()}
@@ -210,7 +212,86 @@ def analyze(path):
         base.update({'evidence':'','review_flags':'Could not fully parse','analysis_error':f'{type(exc).__name__}: {exc}'})
     return base
 
-# Run the triage, calculate AI likelihood scores, and produce the consolidated report.
+# Inventory additional metadata as individual observations with their source part.
+# Values are document-supplied and may be absent, stale or edited by the author.
+def metadata_inventory(path):
+    rows = []
+    def add(source, field, value):
+        value = clean(value)
+        if value:
+            rows.append({'relative_path': str(path.relative_to(EXTRACT)),
+                         'source': source, 'field': field, 'value': value})
+    if path.suffix.lower() not in OOXML:
+        try:
+            reader = PdfReader(str(path))
+            if reader.is_encrypted:
+                add('PDF', 'encrypted', 'Yes')
+                if not reader.decrypt(''):
+                    add('PDF', 'inventory_status', 'Password required; metadata may be unavailable')
+                    return rows
+            for key, value in (reader.metadata or {}).items():
+                add('PDF document information', key, value)
+            add('PDF', 'pages', len(reader.pages))
+            add('PDF', 'encrypted', 'Yes' if reader.is_encrypted else 'No')
+        except Exception as exc:
+            add('PDF', 'inventory_error', f'{type(exc).__name__}: {exc}')
+        return rows
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            # Preserve all core, extended and named custom properties, including
+            # revision, document statistics and custom property names and types.
+            for part in ('docProps/core.xml', 'docProps/app.xml', 'docProps/custom.xml'):
+                root = read_xml(zf, part)
+                if root is None:
+                    add(part, 'status', 'Missing or unreadable')
+                    continue
+                for child in root:
+                    tag = child.tag.rsplit('}', 1)[-1]
+                    if part.endswith('custom.xml'):
+                        for value_node in child:
+                            value_type = value_node.tag.rsplit('}', 1)[-1]
+                            add(part, f"custom:{child.get('name', '(unnamed)')} ({value_type})", ''.join(value_node.itertext()))
+                    else:
+                        add(part, tag, ' '.join(child.itertext()))
+            add('package', 'contains_vba_project', any(n.lower().endswith('vbaproject.bin') for n in names))
+            add('package', 'contains_digital_signature', any(n.startswith('_xmlsignatures/') for n in names))
+            add('package', 'contains_embedded_objects', any('/embeddings/' in n.lower() for n in names))
+            # Relationships expose external targets and templates, but no content
+            # from comments, changes, or the document body is copied to the report.
+            for part in names:
+                lower = part.lower()
+                if lower.endswith('.rels'):
+                    root = read_xml(zf, part)
+                    if root is not None:
+                        for rel in root:
+                            if rel.get('TargetMode', '').lower() == 'external':
+                                add(part, 'external_relationship_type', rel.get('Type', ''))
+                                add(part, 'external_relationship_target', rel.get('Target', ''))
+                elif lower.endswith('.xml') and ('webextension' in lower or 'comments' in lower or lower in ('word/document.xml', 'xl/workbook.xml')):
+                    root = read_xml(zf, part)
+                    if root is None:
+                        continue
+                    for node in root.iter():
+                        tag = node.tag.rsplit('}', 1)[-1]
+                        if 'webextension' in lower and tag in ('reference', 'alternateReference'):
+                            for key in ('id', 'store', 'storeType', 'version'):
+                                add(part, f'add_in_{key}', node.get(key))
+                        if ('comments' in lower and tag in ('comment', 'author')) or (lower == 'word/document.xml' and tag in ('ins', 'del', 'moveFrom', 'moveTo')):
+                            if tag == 'author':
+                                add(part, 'comment_author', node.text)
+                            for key, value in node.attrib.items():
+                                local = key.rsplit('}', 1)[-1]
+                                if local in ('author', 'date', 'initials'):
+                                    add(part, f'{tag}_{local}', value)
+                        if lower == 'xl/workbook.xml' and tag in ('workbookPr', 'calcPr'):
+                            for key, value in node.attrib.items():
+                                add(part, f'{tag}_{key.rsplit("}", 1)[-1]}', value)
+    except Exception as exc:
+        add('package', 'inventory_error', f'{type(exc).__name__}: {exc}')
+    return rows
+
+# Run the triage, calculate scores, and produce the consolidated report.
 records = [analyze(path) for path in submission_files]
 all_submissions = pd.DataFrame(records)
 
@@ -226,8 +307,10 @@ duplicate_groups = (all_submissions.groupby(['exact_duplicate_group','sha256'], 
 duplicate_groups = duplicate_groups[duplicate_groups['submission_count'] > 1]
 
 # Near-duplicate candidates use an OOXML structural signature
-signature_counts = unique_files['structural_signature'].replace('', pd.NA).value_counts()
-unique_files['similar_structure_group_size'] = unique_files['structural_signature'].map(signature_counts).fillna(1).astype(int)
+if 'structural_signature' not in unique_files.columns:
+    unique_files['structural_signature'] = ''
+signature_counts = unique_files.loc[unique_files['extension'].isin(OOXML), 'structural_signature'].replace('', pd.NA).value_counts()
+unique_files['similar_structure_group_size'] = unique_files['structural_signature'].where(unique_files['extension'].isin(OOXML)).map(signature_counts).fillna(1).astype(int)
 near_duplicates = unique_files[(unique_files['similar_structure_group_size'] > 1) & unique_files['structural_signature'].notna()].copy()
 
 # Define the AI Likelihood Scoring logic
@@ -300,6 +383,15 @@ evidence_columns = ['file_name','relative_path','extension','application','produ
 flags = unique_files.reindex(columns=[c for c in evidence_columns if c in unique_files.columns])
 flags = flags[(flags['evidence'].fillna('') != '') | (flags['review_flags'].fillna('') != '') | (flags['analysis_error'].fillna('') != '')]
 
+# Metadata observations include every submission, not only unique files.
+inventory_rows = [row for path in submission_files for row in metadata_inventory(path)]
+inventory = pd.DataFrame(inventory_rows, columns=['relative_path', 'source', 'field', 'value'])
+# Untrusted file properties and paths must remain literal text in Excel.
+def excel_literal(value):
+    if isinstance(value, str) and value.lstrip().startswith(('=', '+', '-', '@')):
+        return "'" + value
+    return value
+
 # Write consolidated spreadsheet
 OUT_SCORED = '/content/Canvas_Submission_Metadata_Triage_Scored_Report.xlsx'
 with pd.ExcelWriter(OUT_SCORED, engine='openpyxl') as writer:
@@ -314,9 +406,14 @@ with pd.ExcelWriter(OUT_SCORED, engine='openpyxl') as writer:
 
     # Add flags tab
     flag_cols = list(flags.columns) + ['ai_likelihood_score', 'ai_likelihood_reasons']
-    unique_files.reindex(columns=[c for c in flag_cols if c in unique_files.columns]).to_excel(writer, sheet_name='Review Flags', index=False)
+    flags.reindex(columns=[c for c in flag_cols if c in flags.columns]).to_excel(writer, sheet_name='Review Flags', index=False)
+
+    inventory.to_excel(writer, sheet_name='Metadata Inventory', index=False)
 
     for ws in writer.book.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.value = excel_literal(cell.value)
         ws.freeze_panes = 'A2'
         ws.auto_filter.ref = ws.dimensions
         for col in ws.columns:
